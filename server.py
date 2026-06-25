@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import plistlib
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -32,7 +34,7 @@ except ImportError:
     pass
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -60,6 +62,7 @@ _cfg: Dict = {
     "perf_gap_mm": 0.05,
     "bg_image": None,          # Path or None
     "usb": True,
+    "api_key": None,
 }
 
 # ---------------------------------------------------------------------------
@@ -116,9 +119,29 @@ _print_state: Dict = {
     "message": "",
     "error": None,
     "job_id": None,
+    "request_id": None,
 }
 _print_lock = threading.Lock()
 _print_thread: Optional[threading.Thread] = None
+
+
+def _new_request_id() -> str:
+    return secrets.token_urlsafe(12)
+
+
+def _require_api_key(request: Request) -> None:
+    """Require X-API-Key or Authorization: Bearer when an API key is configured."""
+    expected = _cfg.get("api_key")
+    if not expected:
+        return
+
+    supplied = request.headers.get("x-api-key", "")
+    auth = request.headers.get("authorization", "")
+    if not supplied and auth.lower().startswith("bearer "):
+        supplied = auth[7:].strip()
+
+    if not supplied or not secrets.compare_digest(str(supplied), str(expected)):
+        raise HTTPException(401, "Invalid or missing API key")
 
 
 # ---------------------------------------------------------------------------
@@ -529,9 +552,11 @@ async def update_settings(req: SettingsRequest):
 # Routes: print job
 # ---------------------------------------------------------------------------
 @app.post("/api/print/start")
-async def print_start():
+async def print_start(request: Request):
     import asyncio
     global _print_thread
+
+    _require_api_key(request)
 
     with _print_lock:
         if _print_state["status"] == "printing":
@@ -551,6 +576,7 @@ async def print_start():
             "message": "Connecting to printer…",
             "error": None,
             "job_id": None,
+            "request_id": _new_request_id(),
         })
         _print_thread = threading.Thread(
             target=_run_print_job,
@@ -559,7 +585,97 @@ async def print_start():
         )
         _print_thread.start()
 
-    return {"status": "started"}
+        request_id = _print_state["request_id"]
+
+    return {"status": "started", "request_id": request_id}
+
+
+@app.post("/api/print/png")
+async def print_png_sheet(
+    request: Request,
+    margin_mm: float = Query(0.0, ge=0.0, le=20.0),
+    kp: Optional[int] = Query(None, ge=1, le=100),
+    infer_border_mm: float = Query(3.0, ge=0.0, le=20.0),
+    infer_threshold: int = Query(24, ge=1, le=255),
+    ignore_bottom_mm: float = Query(0.0, ge=0.0, le=177.8),
+):
+    """Accept one pre-laid PNG sheet and start a print+cut job.
+
+    The request body must be raw image/png. If alpha contains a useful cut mask
+    it is used; otherwise cut paths are inferred from flattened RGB artwork.
+    """
+    import asyncio
+    global _print_thread
+
+    _require_api_key(request)
+
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
+    if content_type != "image/png":
+        raise HTTPException(415, "Content-Type must be image/png")
+
+    with _print_lock:
+        if _print_state["status"] == "printing":
+            raise HTTPException(409, "A print job is already in progress")
+
+    png_bytes = await request.body()
+    if not png_bytes.startswith(_PNG_MAGIC):
+        raise HTTPException(400, "Request body is not a PNG file")
+
+    def _prepare_png_job():
+        from pixcut.image_to_cut import process_sheet_png
+
+        tmp_png: Optional[Path] = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+                f.write(png_bytes)
+                tmp_png = Path(f.name)
+            return process_sheet_png(
+                tmp_png,
+                dpi=_cfg["dpi"],
+                margin_mm=margin_mm,
+                kp=kp if kp is not None else _cfg["kp"],
+                infer_border_mm=infer_border_mm,
+                infer_threshold=infer_threshold,
+                ignore_bottom_mm=ignore_bottom_mm,
+            )
+        finally:
+            if tmp_png:
+                try:
+                    tmp_png.unlink()
+                except Exception:
+                    pass
+
+    try:
+        result = await asyncio.to_thread(_prepare_png_job)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except ImportError as exc:
+        raise HTTPException(500, str(exc))
+
+    with _print_lock:
+        if _print_state["status"] == "printing":
+            raise HTTPException(409, "A print job is already in progress")
+        _print_state.update({
+            "status": "printing",
+            "message": "Connecting to printer...",
+            "error": None,
+            "job_id": None,
+            "request_id": _new_request_id(),
+        })
+        _print_thread = threading.Thread(
+            target=_run_print_job,
+            args=(result.jpg_bytes, result.plt_bytes),
+            daemon=True,
+        )
+        _print_thread.start()
+        request_id = _print_state["request_id"]
+
+    return {
+        "status": "started",
+        "request_id": request_id,
+        "contours": result.contour_count,
+        "mask_source": result.mask_source,
+    }
 
 
 def _run_print_job(jpg_bytes: bytes, plt_bytes: bytes) -> None:
@@ -638,18 +754,29 @@ def _run_print_job(jpg_bytes: bytes, plt_bytes: bytes) -> None:
 
 
 @app.get("/api/print/status")
-async def print_status():
+async def print_status(request: Request, request_id: Optional[str] = None):
+    _require_api_key(request)
     with _print_lock:
-        return dict(_print_state)
+        state = dict(_print_state)
+    if request_id and state.get("request_id") != request_id:
+        raise HTTPException(404, "Print job not found")
+    return state
 
 
 @app.post("/api/print/reset")
-async def print_reset():
+async def print_reset(request: Request):
     """Reset print state to idle after done/error so a new job can be started."""
+    _require_api_key(request)
     with _print_lock:
         if _print_state["status"] == "printing":
             raise HTTPException(409, "Cannot reset while a job is in progress")
-        _print_state.update({"status": "idle", "message": "", "error": None, "job_id": None})
+        _print_state.update({
+            "status": "idle",
+            "message": "",
+            "error": None,
+            "job_id": None,
+            "request_id": None,
+        })
     return {"status": "idle"}
 
 
@@ -686,6 +813,7 @@ _CONFIG_SCALARS = {
     "vid":           "vid",
     "pid":           "pid",
     "backgrounds":   "backgrounds",
+    "api_key":       "api_key",
 }
 _CONFIG_BOOLS = {
     "usb":         "no_usb",        # usb: false  → --no-usb
@@ -779,6 +907,11 @@ def main() -> None:
     parser.add_argument("--vid", default=None, help="USB Vendor ID hex (e.g. 0x302C)")
     parser.add_argument("--pid", default=None, help="USB Product ID hex (e.g. 0x3101)")
     parser.add_argument("--backgrounds", default="backgrounds", help="Path to backgrounds directory")
+    parser.add_argument(
+        "--api-key",
+        default=os.environ.get("PIXCUT_API_KEY"),
+        help="Require this API key for /api/print/* routes (or set PIXCUT_API_KEY)",
+    )
 
     config_path = Path(pre_args.config)
     file_cfg = _load_config(config_path)
@@ -799,6 +932,7 @@ def main() -> None:
     _cfg["pid"] = int(args.pid, 16) if args.pid else None
     _cfg["backgrounds_dir"] = Path(args.backgrounds).resolve()
     _cfg["backgrounds_dir"].mkdir(parents=True, exist_ok=True)
+    _cfg["api_key"] = args.api_key
 
     # Load admin-only settings (no CLI equivalent) from config file.
     for key in ("perf_cut", "perf_kp", "perf_dash_mm", "perf_gap_mm"):
@@ -817,6 +951,7 @@ def main() -> None:
     log.info("PixCut Kiosk starting on http://%s:%d", args.host, args.port)
     log.info("Stickers dir: %s", _cfg["stickers_dir"].resolve())
     log.info("Backgrounds dir: %s", _cfg["backgrounds_dir"].resolve())
+    log.info("Print API key auth: %s", "enabled" if _cfg["api_key"] else "disabled")
     uvicorn.run(app, host=args.host, port=args.port)
 
 

@@ -476,6 +476,194 @@ class LayoutResult:
     cut_plt: str
 
 
+@dataclass
+class SheetPngResult:
+    jpg_bytes: bytes
+    plt_bytes: bytes
+    cut_svg: str
+    contour_count: int
+    mask_source: str
+
+
+def _jpeg_bytes_under_limit(img: "PIL.Image.Image", max_bytes: int = 1024 * 1024) -> bytes:
+    """Encode JPEG, stepping quality down until it fits the observed device limit."""
+    for quality in (92, 88, 84, 80, 76, 72, 68, 64, 60):
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=quality)
+        data = buf.getvalue()
+        if len(data) <= max_bytes:
+            return data
+    raise ValueError(
+        f"JPEG is still larger than {max_bytes} bytes after compression; "
+        "simplify the artwork or lower the output DPI."
+    )
+
+
+def _infer_flattened_sheet_mask(
+    rgb: "numpy.ndarray",
+    *,
+    dpi: int,
+    threshold: int,
+    border_mm: float,
+    ignore_bottom_mm: float,
+    min_component_mm2: float,
+) -> "numpy.ndarray":
+    """
+    Infer sticker islands from a flattened RGB sheet.
+
+    This is intentionally heuristic: it treats the corner color as the page
+    background, finds pixels that differ from it, grows that content to include
+    the white sticker border, then removes tiny artifacts.
+    """
+    import numpy as np
+    from skimage import morphology
+
+    h, w, _ = rgb.shape
+    patch = max(8, min(80, min(w, h) // 40))
+    corner_samples = np.concatenate([
+        rgb[:patch, :patch].reshape(-1, 3),
+        rgb[:patch, -patch:].reshape(-1, 3),
+        rgb[-patch:, :patch].reshape(-1, 3),
+        rgb[-patch:, -patch:].reshape(-1, 3),
+    ])
+    bg = np.median(corner_samples, axis=0)
+    delta = rgb.astype("int32") - bg.astype("int32")
+    non_bg = np.sqrt(np.sum(delta * delta, axis=2)) >= threshold
+
+    if ignore_bottom_mm > 0:
+        ignore_px = int(round((ignore_bottom_mm / MM_PER_INCH) * dpi))
+        if ignore_px > 0:
+            non_bg[max(0, h - ignore_px):, :] = False
+
+    border_px = int(round((border_mm / MM_PER_INCH) * dpi))
+    if border_px > 0:
+        if hasattr(morphology, "isotropic_dilation"):
+            mask = morphology.isotropic_dilation(non_bg, border_px)
+        else:
+            mask = morphology.binary_dilation(non_bg, morphology.disk(border_px))
+    else:
+        mask = non_bg
+
+    hole_area_px = max(64, int(mask.size * 0.02))
+    mask = morphology.remove_small_holes(mask, area_threshold=hole_area_px)
+
+    min_component_px = max(
+        16,
+        int((min_component_mm2 / (MM_PER_INCH ** 2)) * (dpi ** 2)),
+    )
+    mask = morphology.remove_small_objects(mask, min_size=min_component_px)
+    return mask
+
+
+def process_sheet_png(
+    png_path: Path,
+    *,
+    dpi: int = DEFAULT_LAYOUT_DPI,
+    margin_mm: float = 0.0,
+    min_area_mm2: float = DEFAULT_MIN_AREA_MM2,
+    kp: int = DEFAULT_KP,
+    simplify: float = DEFAULT_SIMPLIFY,
+    straight_dist_eps: float = STRAIGHT_DIST_EPS,
+    infer_flattened: bool = True,
+    infer_threshold: int = 24,
+    infer_border_mm: float = 3.0,
+    ignore_bottom_mm: float = 0.0,
+    infer_min_component_mm2: float = 25.0,
+) -> SheetPngResult:
+    """
+    Process one pre-laid 4x7 PNG sheet.
+
+    If a meaningful alpha channel exists, it is used as the cut mask. If the
+    PNG is flattened/fully opaque, a mask is inferred from the rendered RGB
+    content instead.
+    """
+    _check_deps()
+    from PIL import Image
+    import numpy as np
+
+    canvas_w_px = int(CANVAS_W_IN * dpi)
+    canvas_h_px = int(CANVAS_H_IN * dpi)
+    expected_ratio = CANVAS_W_IN / CANVAS_H_IN
+
+    img = Image.open(png_path).convert("RGBA")
+    ratio = img.width / img.height
+    if abs(ratio - expected_ratio) > 0.01:
+        raise ValueError(
+            f"PNG must be a 4x7 sheet. Got {img.width}x{img.height}; "
+            "generate a 4:7 canvas such as 1200x2100 or 2880x5040."
+        )
+
+    if img.size != (canvas_w_px, canvas_h_px):
+        img = img.resize((canvas_w_px, canvas_h_px), Image.LANCZOS)
+
+    alpha = np.array(img.split()[3])
+    rgb = np.array(img.convert("RGB"))
+    mask_source = "alpha"
+
+    if not np.any(alpha > 10):
+        raise ValueError("PNG alpha is fully transparent; no cuttable sticker area was found.")
+
+    if np.all(alpha == 255):
+        if not infer_flattened:
+            raise ValueError(
+                "PNG alpha is fully opaque, so the only detectable cut path is the whole sheet."
+            )
+        mask = _infer_flattened_sheet_mask(
+            rgb,
+            dpi=dpi,
+            threshold=infer_threshold,
+            border_mm=infer_border_mm,
+            ignore_bottom_mm=ignore_bottom_mm,
+            min_component_mm2=infer_min_component_mm2,
+        )
+        mask_source = "inferred-rgb"
+    else:
+        if np.any(alpha == 254) or np.min(alpha) >= 250:
+            mask = alpha == 255
+        else:
+            mask = alpha > 10
+
+    coverage = float(np.count_nonzero(mask)) / float(mask.size)
+    if coverage <= 0.0:
+        raise ValueError("No cuttable sticker area was found in the PNG.")
+    if coverage > 0.95:
+        raise ValueError(
+            "PNG cut mask covers almost the whole sheet. Set alpha 255 only on sticker regions, "
+            "not on the page background, or adjust the flattened PNG inference parameters."
+        )
+
+    min_area_px = (min_area_mm2 / (MM_PER_INCH ** 2)) * (dpi ** 2)
+    raw_contours = _trace_contours(mask, min_area_px)
+    if not raw_contours:
+        raise ValueError("No usable cut contours found in the PNG cut mask.")
+
+    margin_px = (margin_mm / MM_PER_INCH) * dpi
+    kiss_contours = _apply_margin(raw_contours, margin_px)
+    kiss_contours = [prune_straight_segments(c, dist_eps=straight_dist_eps) for c in kiss_contours]
+    kiss_contours = [simplify_polyline(c, simplify) for c in kiss_contours if len(c) >= 3]
+    if not kiss_contours:
+        raise ValueError("No usable cut contours remained after simplification.")
+
+    white = Image.new("RGBA", img.size, (255, 255, 255, 255))
+    composite_rgb = Image.alpha_composite(white, img).convert("RGB")
+    jpg_bytes = _jpeg_bytes_under_limit(composite_rgb)
+
+    plt_kiss = _canvas_to_plt_coords(kiss_contours, canvas_w_px, canvas_h_px)
+    plt_parts = ["IN", "VER0.1.0", f"KP{kp}"]
+    plt_parts += _plt_path_commands(plt_kiss)
+    plt_parts.append(" U6476,0 @ ")
+    cut_plt = " ".join(plt_parts)
+
+    cut_svg = _contours_to_svg(kiss_contours, canvas_w_px, canvas_h_px, dpi)
+    return SheetPngResult(
+        jpg_bytes=jpg_bytes,
+        plt_bytes=cut_plt.encode("ascii"),
+        cut_svg=cut_svg,
+        contour_count=len(kiss_contours),
+        mask_source=mask_source,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Top-level API
 # ---------------------------------------------------------------------------

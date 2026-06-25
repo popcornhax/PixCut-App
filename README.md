@@ -353,6 +353,95 @@ Controls:
 - **Print & Cut** — finalise the layout, send to the printer, and display a live status overlay (polling every 1.5 s).
 - **Overflow banner** — appears when stickers don't fit; reduce count or size.
 
+### PNG print endpoint
+
+For web apps that generate the final sheet upstream, start the server on the
+machine connected to the PixCut and POST a raw PNG body:
+
+```bash
+export PIXCUT_API_KEY="replace-with-a-long-random-secret"
+python server.py --host 0.0.0.0 --port 8000
+
+curl -X POST \
+  -H "Content-Type: image/png" \
+  -H "X-API-Key: replace-with-a-long-random-secret" \
+  --data-binary @sheet.png \
+  "http://localhost:8000/api/print/png"
+```
+
+The print response includes a server-side `request_id`:
+
+```json
+{
+  "status": "started",
+  "request_id": "Jq7U0h9kMiXc1myA",
+  "contours": 7,
+  "mask_source": "inferred-rgb"
+}
+```
+
+Poll that job until `status` is `done` or `error`:
+
+```bash
+curl \
+  -H "X-API-Key: replace-with-a-long-random-secret" \
+  "http://localhost:8000/api/print/status?request_id=Jq7U0h9kMiXc1myA"
+```
+
+`/api/print/png` accepts only PNG input. Internally it converts the sheet to the
+printer's JPEG format and creates PLT cut paths. If the PNG has a useful alpha
+mask, alpha is used. If the PNG is flattened/fully opaque, the API infers sticker
+islands from the visible RGB artwork.
+
+Generated PNG contract:
+
+- Canvas must be 4:7, for example `1200x2100` at 300 DPI or `2880x5040` at 720 DPI.
+- Use a white or near-white page background.
+- Keep stickers visually separated; the inference expands artwork outward by `infer_border_mm`, so leave at least a few mm of empty space between stickers.
+- Render flat sticker artwork. Do not bake in mockup effects such as drop shadows, glow, bevels, or lighting.
+- Treat logos/branding as sticker artwork too if they should be cut out; keep them visually separated from the other stickers.
+- Avoid pale, borderless sticker edges on a white background; the API needs visible contrast to find each sticker island.
+
+Optional alpha mask:
+
+- Alpha `255` means cuttable sticker material, including the full white border.
+- Alpha `0` means transparent/non-cut background.
+- Alpha `254` means visible print-only pixels, useful for page branding or a logo that should print but not be cut.
+
+Optional query params: `margin_mm=0..20` adds an outward cut offset, `kp=1..100`
+overrides knife pressure, `infer_border_mm=0..20` controls how far flattened
+artwork is grown into a cut shape, `infer_threshold=1..255` controls background
+sensitivity, and `ignore_bottom_mm=0..177.8` can reserve a print-only bottom
+band if you ever need one. The endpoint defaults to `ignore_bottom_mm=0`, so
+all visible artwork can become stickers.
+
+API key auth:
+
+- Set `PIXCUT_API_KEY`, pass `--api-key`, or set `api_key` in `server.json`.
+- When configured, all `/api/print/*` routes require either `X-API-Key: ...` or `Authorization: Bearer ...`.
+- If the Lovable app is frontend-only, this key is visible to users. Prefer calling PixCut from a server-side Lovable action/proxy, Cloudflare Worker, or other backend that keeps the key secret.
+- Use HTTPS when exposing beyond your LAN; a tunnel such as Cloudflare Tunnel, Tailscale Funnel, ngrok, or a reverse proxy can terminate TLS and forward to `http://127.0.0.1:8000`.
+
+Lovable/browser fetch sketch:
+
+```js
+const printRes = await fetch(`${PIXCUT_BASE_URL}/api/print/png`, {
+  method: "POST",
+  headers: {
+    "Content-Type": "image/png",
+    "X-API-Key": PIXCUT_API_KEY,
+  },
+  body: pngBlob,
+});
+const job = await printRes.json();
+
+const statusRes = await fetch(
+  `${PIXCUT_BASE_URL}/api/print/status?request_id=${encodeURIComponent(job.request_id)}`,
+  { headers: { "X-API-Key": PIXCUT_API_KEY } },
+);
+const status = await statusRes.json();
+```
+
 ### Server options
 
 ```bash
@@ -378,6 +467,7 @@ Defaults are read from `server.json` in the project root. CLI flags always overr
 |`auto_detect`|`true`|Auto-detect printer VID/PID|
 |`vid`|`null`|Explicit USB Vendor ID hex string, e.g. `"0x302C"`|
 |`pid`|`null`|Explicit USB Product ID hex string, e.g. `"0x3101"`|
+|`api_key`|`null`|Optional API key required for `/api/print/*` routes|
 |`perf_cut`|`false`|Enable perf-cut (pop-out lines)|
 |`perf_kp`|`53`|Perf-cut knife pressure|
 |`perf_dash_mm`|`8.0`|Perf-cut dash length (kiss-cut bridges)|
@@ -401,6 +491,7 @@ CLI flags (all correspond to the keys above):
 |`--no-usb`|Disable USB drive scanning|
 |`--no-auto-detect`|Disable USB auto-detect|
 |`--vid / --pid`|Explicit USB VID/PID (hex)|
+|`--api-key KEY`|Require an API key for `/api/print/*` routes|
 
 ### Sticker organisation
 
